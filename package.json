@@ -1,14 +1,14 @@
 {
-  "name": "@homebridge/hap-nodejs",
+  "name": "@keus-automation/keus-hap-nodejs",
   "version": "2.1.0",
-  "description": "HAP-NodeJS is a Node.js implementation of HomeKit Accessory Server.",
+  "description": "Keus HAP-NodeJS is a Node.js implementation of HomeKit Accessory Server.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "maintainers": [
     "Andreas Bauer <mail@anderl-bauer.de>"
   ],
   "author": "Khaos Tian <khaos.tian@gmail.com> (https://tz.is/)",
-  "homepage": "https://github.com/homebridge/HAP-NodeJS",
+  "homepage": "https://github.com/keus-automation/keus-hap-nodejs/",
   "license": "Apache-2.0",
   "scripts": {
     "check": "npm install && npm outdated",
@@ -38,10 +38,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/homebridge/HAP-NodeJS.git"
+    "url": "git+https://github.com/keus-automation/keus-hap-nodejs.git"
   },
   "bugs": {
-    "url": "https://github.com/homebridge/HAP-NodeJS/issues"
+    "url": "https://github.com/keus-automation/keus-hap-nodejs/issues"
   },
   "engines": {
     "node": "^22 || ^24"
