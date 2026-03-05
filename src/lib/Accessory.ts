@@ -316,6 +316,58 @@ const enum WriteRequestState {
   TIMED_WRITE_REJECTED
 }
 
+// --- Batch Handler Types ---
+
+/**
+ * Represents a single characteristic read request in a batch GET operation.
+ * @group Accessory
+ */
+export interface BatchReadItem {
+  aid: number;
+  iid: number;
+  accessoryDisplayName: string;
+  serviceDisplayName: string;
+  characteristicDisplayName: string;
+  characteristic: Characteristic;
+  service: Service;
+  accessory: Accessory;
+}
+
+/**
+ * Represents a single characteristic write request in a batch SET operation.
+ * @group Accessory
+ */
+export interface BatchWriteItem {
+  aid: number;
+  iid: number;
+  accessoryDisplayName: string;
+  serviceDisplayName: string;
+  characteristicDisplayName: string;
+  value: CharacteristicValue;
+  characteristic: Characteristic;
+  service: Service;
+  accessory: Accessory;
+}
+
+/**
+ * Handler for batch GET operations. Receives all characteristics being read at once.
+ * Must return a Record keyed by "aid.iid" with the value for each characteristic.
+ * @group Accessory
+ */
+export type BatchGetHandler = (
+  items: BatchReadItem[],
+  connection?: HAPConnection,
+) => Promise<Record<string, Nullable<CharacteristicValue>>> | Record<string, Nullable<CharacteristicValue>>;
+
+/**
+ * Handler for batch SET operations. Receives all characteristics being written at once.
+ * @group Accessory
+ */
+export type BatchSetHandler = (
+  items: BatchWriteItem[],
+  connection?: HAPConnection,
+) => Promise<void> | void;
+
 /**
  * @group Accessory
  */
@@ -454,6 +506,17 @@ export class Accessory extends EventEmitter {
    * For multiple bursts of /accessories request we don't want to always contact GET handlers
    */
   private lastAccessoriesRequest = 0;
+
+  /**
+   * Optional batch GET handler. When registered, all characteristic reads in a single HomeKit
+   * request are collected and passed to this handler in one call instead of individual onGet handlers.
+   */
+  private batchGetHandler?: BatchGetHandler;
+  /**
+   * Optional batch SET handler. When registered, all characteristic writes in a single HomeKit
+   * request are collected and passed to this handler in one call instead of individual onSet handlers.
+   */
+  private batchSetHandler?: BatchSetHandler;
 
   constructor(public displayName: string, public UUID: string) {
     super();
@@ -721,6 +784,44 @@ export class Accessory extends EventEmitter {
   protected findCharacteristic(aid: number, iid: number): Characteristic | undefined {
     const accessory = this.getAccessoryByAID(aid);
     return accessory && accessory.getCharacteristicByIID(iid);
+  }
+
+  /**
+   * Like {@link findCharacteristic} but also returns the owning Accessory and Service.
+   */
+  protected findCharacteristicWithContext(aid: number, iid: number): { accessory: Accessory; service: Service; characteristic: Characteristic } | undefined {
+    const accessory = this.getAccessoryByAID(aid);
+    if (!accessory) {
+      return undefined;
+    }
+
+    for (const service of accessory.services) {
+      const characteristic = service.getCharacteristicByIID(iid);
+      if (characteristic) {
+        return { accessory, service, characteristic };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Register a batch GET handler. When set, all characteristic reads in a single HomeKit
+   * request are batched and passed to this handler instead of calling individual onGet handlers.
+   *
+   * The handler must return a Record keyed by "aid.iid" strings with the value for each characteristic.
+   */
+  public onBatchGet(handler: BatchGetHandler): Accessory {
+    this.batchGetHandler = handler;
+    return this;
+  }
+
+  /**
+   * Register a batch SET handler. When set, all characteristic writes in a single HomeKit
+   * request are batched and passed to this handler instead of calling individual onSet handlers.
+   */
+  public onBatchSet(handler: BatchSetHandler): Accessory {
+    this.batchSetHandler = handler;
+    return this;
   }
 
   /**
@@ -1441,6 +1542,17 @@ export class Accessory extends EventEmitter {
       return;
     }
 
+    // --- BATCH GET PATH ---
+    if (this.batchGetHandler) {
+      this.handleBatchGetCharacteristics(connection, request, characteristics, response, callback)
+        .catch((error) => {
+          console.error(`[${this.displayName}] Batch GET handler encountered an unexpected error: ${error?.stack || error}`);
+          callback({ httpCode: HAPHTTPCode.INTERNAL_SERVER_ERROR, status: HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+        });
+      return;
+    }
+
+    // --- INDIVIDUAL GET PATH (original behavior) ---
     let timeout: NodeJS.Timeout | undefined = setTimeout(() => {
       for (const id of missingCharacteristics) {
         const split = id.split(".");
@@ -1515,6 +1627,136 @@ export class Accessory extends EventEmitter {
         }
       });
     }
+  }
+
+  /**
+   * Batch GET: resolves all characteristics, does permission checks, calls the batch handler once,
+   * applies values, and builds the response.
+   */
+  private async handleBatchGetCharacteristics(
+    connection: HAPConnection,
+    request: CharacteristicsReadRequest,
+    characteristics: CharacteristicReadData[],
+    response: CharacteristicsReadResponse,
+    callback: ReadCharacteristicsCallback,
+  ): Promise<void> {
+    const batchItems: BatchReadItem[] = [];
+
+    // Phase 1: Resolve characteristics and run permission checks
+    for (const id of request.ids) {
+      const ctx = this.findCharacteristicWithContext(id.aid, id.iid);
+
+      if (!ctx) {
+        debug("[%s] Could not find a Characteristic with aid of %s and iid of %s", this.displayName, id.aid, id.iid);
+        characteristics.push({ aid: id.aid, iid: id.iid, status: HAPStatus.INVALID_VALUE_IN_REQUEST });
+        continue;
+      }
+
+      if (!ctx.characteristic.props.perms.includes(Perms.PAIRED_READ)) {
+        debug("[%s] Tried reading from characteristic which does not allow reading (aid of %s and iid of %s)", this.displayName, id.aid, id.iid);
+        characteristics.push({ aid: id.aid, iid: id.iid, status: HAPStatus.WRITE_ONLY_CHARACTERISTIC });
+        continue;
+      }
+
+      if (ctx.characteristic.props.adminOnlyAccess && ctx.characteristic.props.adminOnlyAccess.includes(Access.READ)) {
+        const verifiable = this._accessoryInfo && connection.username;
+        if (!verifiable || !this._accessoryInfo!.hasAdminPermissions(connection.username!)) {
+          characteristics.push({ aid: id.aid, iid: id.iid, status: HAPStatus.INSUFFICIENT_PRIVILEGES });
+          continue;
+        }
+      }
+
+      const batchItem: BatchReadItem = {
+        aid: id.aid,
+        iid: id.iid,
+        accessoryDisplayName: ctx.accessory.displayName,
+        serviceDisplayName: ctx.service.displayName,
+        characteristicDisplayName: ctx.characteristic.displayName,
+        characteristic: ctx.characteristic,
+        service: ctx.service,
+        accessory: ctx.accessory,
+      };
+      // Make object references non-enumerable to prevent circular reference errors in JSON.stringify
+      Object.defineProperty(batchItem, "characteristic", { enumerable: false });
+      Object.defineProperty(batchItem, "service", { enumerable: false });
+      Object.defineProperty(batchItem, "accessory", { enumerable: false });
+      batchItems.push(batchItem);
+    }
+
+    // Phase 2: Call batch handler and apply values
+    if (batchItems.length > 0) {
+      try {
+        const values = await this.batchGetHandler!(batchItems, connection);
+
+        // Phase 3: Apply returned values to each characteristic
+        for (const item of batchItems) {
+          try {
+            const key = item.aid + "." + item.iid;
+            const rawValue = values[key];
+
+            if (rawValue === undefined) {
+              debug("[%s] Batch GET handler did not return value for %s, using cached value", this.displayName, key);
+            }
+
+            const value = rawValue !== undefined ? rawValue : item.characteristic.value;
+            const formattedValue = formatOutgoingCharacteristicValue(value, item.characteristic.props);
+
+            // Update characteristic internal value and emit CHANGE if changed
+            const oldValue = item.characteristic.value;
+            item.characteristic.value = value;
+            if (oldValue !== value) {
+              item.characteristic.emit(CharacteristicEventTypes.CHANGE, {
+                originator: connection,
+                oldValue: oldValue,
+                newValue: value,
+                reason: ChangeReason.READ,
+                context: undefined,
+              });
+            }
+
+            const data: CharacteristicReadData = {
+              aid: item.aid,
+              iid: item.iid,
+              value: formattedValue == null ? null : formattedValue,
+            };
+
+            if (request.includeMeta) {
+              data.format = item.characteristic.props.format;
+              data.unit = item.characteristic.props.unit;
+              data.minValue = item.characteristic.props.minValue;
+              data.maxValue = item.characteristic.props.maxValue;
+              data.minStep = item.characteristic.props.minStep;
+              data.maxLen = item.characteristic.props.maxLen || item.characteristic.props.maxDataLen;
+            }
+            if (request.includePerms) {
+              data.perms = item.characteristic.props.perms;
+            }
+            if (request.includeType) {
+              data.type = toShortForm(item.characteristic.UUID);
+            }
+            if (request.includeEvent) {
+              data.ev = connection.hasEventNotifications(item.aid, item.iid);
+            }
+
+            characteristics.push(data);
+          } catch (perItemError) {
+            debug("[%s] Error processing batch read result for %s.%s: %s",
+              this.displayName, item.aid, item.iid, (perItemError as Error)?.message);
+            characteristics.push({ aid: item.aid, iid: item.iid, status: HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+          }
+        }
+      } catch (error) {
+        // Batch handler itself threw — mark all unprocessed batch items as failed
+        for (const item of batchItems) {
+          // Only add error if we haven't already added a result for this item
+          if (!characteristics.some(c => c.aid === item.aid && c.iid === item.iid)) {
+            characteristics.push({ aid: item.aid, iid: item.iid, status: HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+          }
+        }
+      }
+    }
+
+    callback(undefined, response);
   }
 
   private async handleCharacteristicRead(
@@ -1611,6 +1853,17 @@ export class Accessory extends EventEmitter {
       return;
     }
 
+    // --- BATCH SET PATH ---
+    if (this.batchSetHandler) {
+      this.handleBatchSetCharacteristics(connection, writeRequest, writeState, characteristics, response, callback)
+        .catch((error) => {
+          console.error(`[${this.displayName}] Batch SET handler encountered an unexpected error: ${error?.stack || error}`);
+          callback({ httpCode: HAPHTTPCode.INTERNAL_SERVER_ERROR, status: HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+        });
+      return;
+    }
+
+    // --- INDIVIDUAL SET PATH (original behavior) ---
     let timeout: NodeJS.Timeout | undefined = setTimeout(() => {
       for (const id of missingCharacteristics) {
         const split = id.split(".");
@@ -1685,6 +1938,166 @@ export class Accessory extends EventEmitter {
         }
       });
     }
+  }
+
+  /**
+   * Batch SET: resolves all characteristics, does permission checks, handles event subscriptions
+   * per-characteristic, collects value writes into a batch, calls the batch handler once,
+   * applies values, and builds the response.
+   */
+  private async handleBatchSetCharacteristics(
+    connection: HAPConnection,
+    writeRequest: CharacteristicsWriteRequest,
+    writeState: WriteRequestState,
+    characteristics: CharacteristicWriteData[],
+    response: CharacteristicsWriteResponse,
+    callback: WriteCharacteristicsCallback,
+  ): Promise<void> {
+    const batchItems: BatchWriteItem[] = [];
+
+    // Phase 1: Resolve characteristics, handle ev subscriptions, run permission checks for value writes
+    for (const data of writeRequest.characteristics) {
+      const ctx = this.findCharacteristicWithContext(data.aid, data.iid);
+
+      if (!ctx) {
+        debug("[%s] Could not find a Characteristic with aid of %s and iid of %s", this.displayName, data.aid, data.iid);
+        characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INVALID_VALUE_IN_REQUEST });
+        continue;
+      }
+
+      if (writeState === WriteRequestState.TIMED_WRITE_REJECTED) {
+        characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INVALID_VALUE_IN_REQUEST });
+        continue;
+      }
+
+      if (data.ev == null && data.value == null) {
+        characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INVALID_VALUE_IN_REQUEST });
+        continue;
+      }
+
+      // Handle event subscription changes (protocol-level, not batchable)
+      if (data.ev != null) {
+        if (!ctx.characteristic.props.perms.includes(Perms.NOTIFY)) {
+          debug("[%s] Tried %s notifications for Characteristic which does not allow notify (aid of %s and iid of %s)",
+            this.displayName, data.ev ? "enabling" : "disabling", data.aid, data.iid);
+          characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.NOTIFICATION_NOT_SUPPORTED });
+          continue;
+        }
+
+        if (ctx.characteristic.props.adminOnlyAccess && ctx.characteristic.props.adminOnlyAccess.includes(Access.NOTIFY)) {
+          const verifiable = connection.username && this._accessoryInfo;
+          if (!verifiable || !this._accessoryInfo!.hasAdminPermissions(connection.username!)) {
+            characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INSUFFICIENT_PRIVILEGES });
+            continue;
+          }
+        }
+
+        const notificationsEnabled = connection.hasEventNotifications(data.aid, data.iid);
+        if (data.ev && !notificationsEnabled) {
+          connection.enableEventNotifications(data.aid, data.iid);
+          ctx.characteristic.subscribe();
+        } else if (!data.ev && notificationsEnabled) {
+          ctx.characteristic.unsubscribe();
+          connection.disableEventNotifications(data.aid, data.iid);
+        }
+      }
+
+      // Collect value writes for batch handler
+      if (data.value != null) {
+        if (!ctx.characteristic.props.perms.includes(Perms.PAIRED_WRITE)) {
+          debug("[%s] Tried writing to Characteristic which does not allow writing (aid of %s and iid of %s)", this.displayName, data.aid, data.iid);
+          characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.READ_ONLY_CHARACTERISTIC });
+          continue;
+        }
+
+        if (ctx.characteristic.props.adminOnlyAccess && ctx.characteristic.props.adminOnlyAccess.includes(Access.WRITE)) {
+          const verifiable = connection.username && this._accessoryInfo;
+          if (!verifiable || !this._accessoryInfo!.hasAdminPermissions(connection.username!)) {
+            characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INSUFFICIENT_PRIVILEGES });
+            continue;
+          }
+        }
+
+        if (ctx.characteristic.props.perms.includes(Perms.ADDITIONAL_AUTHORIZATION) && ctx.characteristic.additionalAuthorizationHandler) {
+          let allowWrite;
+          try {
+            allowWrite = ctx.characteristic.additionalAuthorizationHandler(data.authData);
+          } catch (error) {
+            console.warn("[" + this.displayName + "] Additional authorization handler has thrown an error when checking authData: " + (error as Error).stack);
+            allowWrite = false;
+          }
+          if (!allowWrite) {
+            characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INSUFFICIENT_AUTHORIZATION });
+            continue;
+          }
+        }
+
+        if (ctx.characteristic.props.perms.includes(Perms.TIMED_WRITE) && writeState !== WriteRequestState.TIMED_WRITE_AUTHENTICATED) {
+          debug("[%s] Tried writing to a timed write only Characteristic without properly preparing (iid of %s and aid of %s)",
+            this.displayName, data.aid, data.iid);
+          characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.INVALID_VALUE_IN_REQUEST });
+          continue;
+        }
+
+        const batchItem: BatchWriteItem = {
+          aid: data.aid,
+          iid: data.iid,
+          accessoryDisplayName: ctx.accessory.displayName,
+          serviceDisplayName: ctx.service.displayName,
+          characteristicDisplayName: ctx.characteristic.displayName,
+          value: data.value,
+          characteristic: ctx.characteristic,
+          service: ctx.service,
+          accessory: ctx.accessory,
+        };
+        // Make object references non-enumerable to prevent circular reference errors in JSON.stringify
+        Object.defineProperty(batchItem, "characteristic", { enumerable: false });
+        Object.defineProperty(batchItem, "service", { enumerable: false });
+        Object.defineProperty(batchItem, "accessory", { enumerable: false });
+        batchItems.push(batchItem);
+      } else {
+        // ev-only change with no value write — success
+        characteristics.push({ aid: data.aid, iid: data.iid, status: HAPStatus.SUCCESS });
+      }
+    }
+
+    // Phase 2: Call batch handler
+    if (batchItems.length > 0) {
+      try {
+        await this.batchSetHandler!(batchItems, connection);
+
+        // Phase 3: Apply values to characteristics and emit CHANGE events
+        for (const item of batchItems) {
+          try {
+            const oldValue = item.characteristic.value;
+            item.characteristic.value = item.value;
+            item.characteristic.emit(CharacteristicEventTypes.CHANGE, {
+              originator: connection,
+              oldValue: oldValue,
+              newValue: item.value,
+              reason: ChangeReason.WRITE,
+              context: undefined,
+            });
+
+            debug("[%s] Setting Characteristic \"%s\" to value %s", this.displayName, item.characteristic.displayName, item.value);
+            characteristics.push({ aid: item.aid, iid: item.iid, status: HAPStatus.SUCCESS });
+          } catch (perItemError) {
+            debug("[%s] Error processing batch write result for %s.%s: %s",
+              this.displayName, item.aid, item.iid, (perItemError as Error)?.message);
+            characteristics.push({ aid: item.aid, iid: item.iid, status: HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+          }
+        }
+      } catch (error) {
+        // Batch handler itself threw — mark all unprocessed batch items as failed
+        for (const item of batchItems) {
+          if (!characteristics.some(c => c.aid === item.aid && c.iid === item.iid)) {
+            characteristics.push({ aid: item.aid, iid: item.iid, status: HAPStatus.SERVICE_COMMUNICATION_FAILURE });
+          }
+        }
+      }
+    }
+
+    callback(undefined, response);
   }
 
   private async handleCharacteristicWrite(
