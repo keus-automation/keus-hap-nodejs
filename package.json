@@ -1,6 +1,6 @@
 {
   "name": "@keus-automation/keus-hap-nodejs",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Keus HAP-NodeJS is a Node.js implementation of HomeKit Accessory Server.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

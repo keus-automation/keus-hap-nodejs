@@ -2,6 +2,12 @@
 
 All notable changes to `hap-nodejs` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
+## v2.1.1 (2026-10-21)
+
+### Changes
+
+- `HAPStorage.setCustomStoragePath` no longer throws when called again with the path that is already open. A plugin that is reloaded in the same process (for example the Keus core plugin on reinstall, with hap shared from common-modules) re-applies the same path on every load. A different path still throws.
+
 ## v2.1.0 (2026-02-08)
 
 ### Changes

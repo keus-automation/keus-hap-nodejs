@@ -41,6 +41,24 @@ describe(HAPStorage, () => {
       storage.storage();
       expect(() => storage.setCustomStoragePath("customPath")).toThrow(Error);
     });
+
+    it("should accept the same custom storage path again after storage has been initialized", () => {
+      const storage = new HAPStorage();
+
+      storage.setCustomStoragePath("samePath");
+      const localStore = storage.storage();
+      expect(() => storage.setCustomStoragePath("samePath")).not.toThrow();
+      expect(storage.storage()).toBe(localStore);
+      expect(localStore.initSync).toHaveBeenCalledTimes(1);
+    });
+
+    it("should reject a different custom storage path after storage has been initialized", () => {
+      const storage = new HAPStorage();
+
+      storage.setCustomStoragePath("firstPath");
+      storage.storage();
+      expect(() => storage.setCustomStoragePath("otherPath")).toThrow(Error);
+    });
   });
 
 });

@@ -38,6 +38,10 @@ export class HAPStorage {
 
   public setCustomStoragePath(path: string): void {
     if (this.localStore) {
+      // A plugin reloaded in the same process re-applies the path it already opened; that is not a change.
+      if (path === this.customStoragePath) {
+        return;
+      }
       throw new Error("Cannot change storage path after it has already been initialized!");
     }
 
